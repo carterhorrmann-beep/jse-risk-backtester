@@ -57,7 +57,7 @@ streamlit run app/streamlit_app.py
 ## Install & Run
 
 ```bash
-git clone https://github.com && cd jse-risk-backtester
+git clone https://github.com/carterhorrmann-beep/jse-risk-backtester && cd jse-risk-backtester
 pip install -e ".[dev,app]"
 pytest -q
 jse-bt backtest --source yfinance --out reports/real
