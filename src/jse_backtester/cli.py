@@ -1,17 +1,19 @@
-"""Command-line interface: ``jse-bt backtest | risk | cost-grid | charts``."""
+"""Command-line interface: ``jse-bt backtest | risk | optimize | cost-grid | charts``."""
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from . import plots
-from .backtest import BacktestConfig, build_factor_returns, rand_hedge_exposure, run_backtest
+from .backtest import WEIGHTINGS, BacktestConfig, build_factor_returns, rand_hedge_exposure, run_backtest
 from .costgrid import DEFAULT_COSTS_BPS, DEFAULT_FACTORS, DEFAULT_REBALANCES, cost_grid, grid_pivot
 from .data import glitch_events, load_prices, split_fx
 from .factors import SIGNALS, factor_regression, ic_summary, information_coefficient
+from .optimize import DEFAULT_MAX_WEIGHT, compare_portfolios, normalise_ticker, read_portfolio_csv
 from .risk import (BUCKET_DOMESTIC, BUCKET_HEDGE, BUCKET_NEUTRAL, BUCKET_UNKNOWN, CURRENCY_ROLL_WINDOW,
                    DEFAULT_RF, SCENARIOS, USDZAR_HEDGE_THRESHOLD, CurrencyExposure, currency_exposure,
                    equal_weight_path, portfolio_risk_report, risk_summary, scenario_table, usdzar_betas)
@@ -20,6 +22,7 @@ from .utils import returns_from_prices
 
 _PLAIN = ("Sharpe", "Sortino", "Calmar", "Beta", "Skew", "kurtosis", "Information", "R^2", "t-stat", "IC")
 DEFAULT_CHARTS_DIR = "docs"
+DEFAULT_PORTFOLIO = "examples/sample_portfolio.csv"
 
 
 # ---------------------------------------------------------------- formatting
@@ -147,12 +150,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help=f"also write README-ready PNGs to DIR (default: {DEFAULT_CHARTS_DIR}/)")
 
 
-def _load(args) -> tuple[pd.DataFrame, pd.Series | None, pd.DataFrame, pd.Series | None]:
+def _load(args, tickers: list[str] | None = None) -> tuple[pd.DataFrame, pd.Series | None, pd.DataFrame, pd.Series | None]:
     """Returns (share prices, benchmark returns, sanitiser events, USD/ZAR daily % changes).
 
     USDZAR=X is split off here so it is never ranked, weighted or risk-decomposed as a stock.
+    ``tickers`` (default: the JSE universe) is what yfinance downloads / the simulator generates.
     """
-    px = load_prices(start=args.start, end=args.end, source=args.source,
+    px = load_prices(tickers=tickers, start=args.start, end=args.end, source=args.source,
                      benchmark=args.benchmark, csv_path=args.csv)
     events = glitch_events(px)
     bench = None
@@ -199,6 +203,14 @@ def _prep_out(args, events: pd.DataFrame) -> Path:
 
 
 # ---------------------------------------------------------------- commands
+def _weighting_label(args) -> str:
+    if args.weighting == "min_var":
+        return f"min_var (cap {args.max_weight:.0%}, trailing 252d shrunk cov)"
+    if args.weighting == "risk_parity":
+        return "risk_parity (trailing 252d shrunk cov)"
+    return args.weighting
+
+
 def cmd_backtest(args) -> None:
     px, bench, events, fx_ret = _load(args)
     out = _prep_out(args, events)
@@ -206,6 +218,7 @@ def cmd_backtest(args) -> None:
     cfg = BacktestConfig(
         signal=args.factor, top_frac=args.top_frac, long_only=not args.long_short,
         weighting=args.weighting, rebalance=args.rebalance, stt=args.stt, brokerage=args.brokerage,
+        max_weight=args.max_weight,
     )
     res = run_backtest(px, cfg)
     start = res.returns.index[0]
@@ -218,7 +231,7 @@ def cmd_backtest(args) -> None:
         table["Benchmark"] = risk_summary(b, None, args.rf)
     text = [f"# JSE factor backtest: {args.factor}\n",
             f"Universe: {px.shape[1]} stocks | {start.date()} to {res.returns.index[-1].date()} | "
-            f"rebalance {args.rebalance} | top {args.top_frac:.0%} | {args.weighting} | "
+            f"rebalance {args.rebalance} | top {args.top_frac:.0%} | {_weighting_label(args)} | "
             f"STT {args.stt:.2%} + brokerage {args.brokerage:.2%}\n",
             "## Performance & risk\n```\n" + fmt_summary(table) + "\n```\n"]
 
@@ -331,6 +344,82 @@ def cmd_risk(args) -> None:
     print(f"Report written to {out}/" + (f" (charts also in {args.save_charts}/)" if args.save_charts else ""))
 
 
+def _pct(v: float) -> str:
+    return f"{v:.1%}"
+
+
+def optimisation_tables(res) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(per-stock weight / risk-share table, portfolio metrics table) as display strings."""
+    cols = {}
+    for m in res.weights.columns:
+        cols[(res.labels[m], "weight")] = res.weights[m]
+        cols[(res.labels[m], "risk share")] = res.risk_shares[m]
+    raw = pd.DataFrame(cols)
+    raw.loc["Total"] = raw.sum()
+    per_stock = raw.apply(lambda c: c.map(_pct))
+    fmt = {"Ann. volatility": _pct, "Max drawdown": _pct, "Sharpe": "{:.2f}".format,
+           "Diversification ratio": "{:.2f}".format, "Look-through USD/ZAR Beta": "{:+.2f}".format}
+    metrics = res.metrics.copy().astype(object)
+    for row, f in fmt.items():
+        metrics.loc[row] = [("n/a" if pd.isna(v) else f(v)) for v in res.metrics.loc[row]]
+    metrics.columns = [res.labels[m] for m in res.metrics.columns]
+    return per_stock, metrics
+
+
+def cmd_optimize(args) -> None:
+    if args.tickers:
+        holdings, tickers = None, list(dict.fromkeys(normalise_ticker(t) for t in args.tickers))
+    else:
+        path = args.weights or DEFAULT_PORTFOLIO
+        if not Path(path).exists():
+            sys.exit(f"jse-bt optimize: portfolio file {path!r} not found (pass --weights FILE or --tickers A B C ...)")
+        try:
+            holdings = read_portfolio_csv(path)
+        except ValueError as exc:
+            sys.exit(f"jse-bt optimize: {exc}")
+        tickers = list(holdings.index)
+
+    px, bench, events, fx_ret = _load(args, tickers)
+    out = _prep_out(args, events)
+    note = _note(args, px)
+    missing = [t for t in tickers if t not in px.columns]
+    if missing:
+        print(f"[warn] holdings with no price data (dropped): {missing}")
+    rets = returns_from_prices(px).iloc[1:]
+    try:
+        res = compare_portfolios(rets, tickers, max_weight=args.max_weight, rf=args.rf,
+                                 fx_returns=fx_ret, current=holdings)
+    except ValueError as exc:
+        sys.exit(f"jse-bt optimize: {exc}")
+
+    per_stock, metrics = optimisation_tables(res)
+    n = len(res.weights)
+    text = [
+        "# JSE portfolio optimisation: Equal Weight vs Min Variance vs Risk Parity\n",
+        f"Universe: {n} stocks | sample {res.sample[0].date()} to {res.sample[1].date()} "
+        f"({res.n_obs} common daily returns) | max weight {args.max_weight:.0%} (Min Variance) | "
+        f"risk-free {args.rf:.1%}\n",
+        "Covariance: sample covariance shrunk 10% toward constant correlation (`risk.shrunk_cov`), the same "
+        "estimator as the risk report. Risk share = Euler contribution to portfolio volatility "
+        "`w_i (S w)_i / (w' S w)`; Risk Parity sets every share to 1/N. Everything here is in-sample; for "
+        "an out-of-sample test use `jse-bt backtest --weighting min_var|risk_parity` (trailing 252-day "
+        "re-estimation, no look-ahead).\n",
+        "## Capital weight vs Euler risk share\n```\n" + per_stock.to_string() + "\n```\n",
+        f"Risk Parity: largest gap between a risk share and 1/N = {res.risk_parity_gap * 100:.6f} percentage "
+        f"points (target share {1 / n:.2%}).\n",
+        "## Portfolio metrics (in-sample, static weights)\n```\n" + metrics.to_string() + "\n```\n",
+        _dq_text(events), "![optimisation](optimize.png)\n",
+    ]
+    _emit(plots.plot_optimisation(res.weights, res.risk_shares, res.metrics, res.labels), "optimize.png", out, args, note)
+
+    res.weights.rename(columns=res.labels).rename_axis("ticker").to_csv(out / "weights.csv")
+    res.risk_shares.rename(columns=res.labels).rename_axis("ticker").to_csv(out / "risk_shares.csv")
+    res.metrics.rename(columns=res.labels).to_csv(out / "metrics.csv")
+    (out / "report.md").write_text("\n".join(text))
+    print("\n".join(text[:-1]))
+    print(f"Report written to {out}/" + (f" (chart also in {args.save_charts}/)" if args.save_charts else ""))
+
+
 def cmd_cost_grid(args) -> None:
     px, _, events, _ = _load(args)
     out = _prep_out(args, events)
@@ -373,6 +462,7 @@ def cmd_charts(args) -> None:
     base = Path(args.out)
     main(["backtest", *common, "--out", str(base / "backtest")])
     main(["risk", *common, "--out", str(base / "risk"), "--weights", args.weights])
+    main(["optimize", *common, "--out", str(base / "optimize"), "--weights", args.weights])
     main(["cost-grid", *common, "--out", str(base / "cost_grid")])
     names = sorted(p.name for p in Path(charts).glob("*.png"))
     print(f"\nREADME charts in {charts}/: {', '.join(names)}")
@@ -388,7 +478,11 @@ def main(argv: list[str] | None = None) -> None:
     bt.add_argument("--factor", choices=list(SIGNALS), default="momentum")
     bt.add_argument("--top-frac", type=float, default=0.3)
     bt.add_argument("--long-short", action="store_true", help="long top / short bottom (research only)")
-    bt.add_argument("--weighting", choices=["equal", "inv_vol"], default="equal")
+    bt.add_argument("--weighting", choices=list(WEIGHTINGS), default="equal",
+                    help="min_var / risk_parity re-estimate the shrunk covariance on the trailing 252 days "
+                         "before each rebalance (no look-ahead)")
+    bt.add_argument("--max-weight", type=float, default=DEFAULT_MAX_WEIGHT,
+                    help="per-stock cap for --weighting min_var (default 0.20)")
     bt.add_argument("--rebalance", choices=["W", "M", "Q"], default="M")
     bt.add_argument("--stt", type=float, default=0.0025, help="Securities Transfer Tax on purchases")
     bt.add_argument("--brokerage", type=float, default=0.0015, help="brokerage + levies, each way")
@@ -398,6 +492,15 @@ def main(argv: list[str] | None = None) -> None:
     _add_common(rk)
     rk.add_argument("--weights", default="examples/sample_portfolio.csv", help="CSV: ticker,weight")
     rk.set_defaults(func=cmd_risk)
+
+    op = sub.add_parser("optimize", help="Equal Weight vs Min Variance vs Risk Parity for a set of JSE holdings")
+    _add_common(op)
+    grp = op.add_mutually_exclusive_group()
+    grp.add_argument("--weights", help=f"CSV: ticker,weight (default {DEFAULT_PORTFOLIO}); also shown as 'Current'")
+    grp.add_argument("--tickers", nargs="+", metavar="TICKER", help="e.g. NPN.JO SBK.JO AGL.JO (the .JO suffix is optional)")
+    op.add_argument("--max-weight", type=float, default=DEFAULT_MAX_WEIGHT,
+                    help="per-stock cap for Min Variance (default 0.20)")
+    op.set_defaults(func=cmd_optimize)
 
     cg = sub.add_parser("cost-grid", help="net CAGR / Sharpe / turnover across costs and rebalance frequencies")
     _add_common(cg)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .backtest import BacktestConfig, run_backtest
+from .optimize import DEFAULT_MAX_WEIGHT
 from .risk import DEFAULT_RF, annualised_return, sharpe
 from .utils import TRADING_DAYS
 
@@ -30,13 +31,14 @@ def cost_grid(
     top_frac: float = 0.3,
     weighting: str = "equal",
     rf: float = DEFAULT_RF,
+    max_weight: float = DEFAULT_MAX_WEIGHT,
 ) -> pd.DataFrame:
     """Tidy DataFrame: factor, rebalance, cost_bps, net_cagr, net_sharpe, annual_turnover, gross_cagr."""
     rows = []
     for factor in factors:
         for freq in rebalances:
             cfg = BacktestConfig(signal=factor, top_frac=top_frac, rebalance=freq,
-                                 weighting=weighting, stt=0.0, brokerage=0.0)
+                                 weighting=weighting, stt=0.0, brokerage=0.0, max_weight=max_weight)
             res = run_backtest(prices, cfg)
             gross = res.gross_returns
             turn = res.turnover.reindex(gross.index).fillna(0.0)

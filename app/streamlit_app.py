@@ -1,12 +1,16 @@
 """Interactive dashboard:  streamlit run app/streamlit_app.py"""
+import io
+
 import pandas as pd
 import streamlit as st
 
 from jse_backtester import plots
-from jse_backtester.backtest import BacktestConfig, build_factor_returns, rand_hedge_exposure, run_backtest
+from jse_backtester.backtest import WEIGHTINGS, BacktestConfig, build_factor_returns, rand_hedge_exposure, run_backtest
+from jse_backtester.cli import fmt_summary, optimisation_tables
 from jse_backtester.costgrid import DEFAULT_COSTS_BPS, cost_grid, grid_pivot
 from jse_backtester.data import glitch_events, load_prices, split_fx
 from jse_backtester.factors import SIGNALS, factor_regression, ic_summary, information_coefficient
+from jse_backtester.optimize import DEFAULT_MAX_WEIGHT, compare_portfolios, read_portfolio_csv
 from jse_backtester.risk import (BUCKET_DOMESTIC, BUCKET_HEDGE, DEFAULT_RF, USDZAR_HEDGE_THRESHOLD,
                                  currency_exposure, equal_weight_path, portfolio_risk_report,
                                  risk_summary, scenario_table, usdzar_betas)
@@ -17,7 +21,10 @@ st.set_page_config(page_title="JSE Risk & Factor Backtester", layout="wide")
 st.title("JSE Portfolio Risk & Factor Backtester")
 
 
-@st.cache_data(show_spinner="Loading prices...")
+SAMPLE_PORTFOLIO = "examples/sample_portfolio.csv"
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading prices...")  # Yahoo downloads are reused for 24h
 def get_prices(source: str, start: str):
     return load_prices(source=source, start=start)
 
@@ -30,7 +37,11 @@ with st.sidebar:
     factor = st.selectbox("Factor", list(SIGNALS))
     top = st.slider("Top fraction", 0.1, 0.5, 0.3, 0.05)
     rebalance = st.selectbox("Rebalance", ["M", "Q", "W"])
-    weighting = st.selectbox("Weighting", ["equal", "inv_vol"])
+    weighting = st.selectbox("Weighting", list(WEIGHTINGS),
+                             help="min_var / risk_parity re-estimate the shrunk covariance on the trailing "
+                                  "252 days before every rebalance (no look-ahead)")
+    max_weight = st.slider("Max weight per stock (min-variance)", 0.05, 1.0, DEFAULT_MAX_WEIGHT, 0.05,
+                           help="Cap for Min Variance in the backtest and the Optimisation tab")
     stt = st.number_input("STT on purchases", 0.0, 0.01, 0.0025, 0.0005, format="%.4f")
     brk = st.number_input("Brokerage (each way)", 0.0, 0.01, 0.0015, 0.0005, format="%.4f")
 
@@ -93,11 +104,62 @@ def currency_panel(exposures: dict, betas: pd.DataFrame, chart_title: str, subje
         st.dataframe(betas.style.format({"beta": "{:+.2f}", "t_stat": "{:.1f}", "r2": "{:.1%}"}, na_rep="n/a"),
                      use_container_width=True)
 
-tab_bt, tab_risk, tab_cost = st.tabs(["Factor backtest", "Portfolio risk", "Cost sensitivity"])
+def holdings_input(key: str) -> "pd.Series | None":
+    """Uploaded ``ticker,weight`` CSV, else the editable sample table. Returns weights summing to 1."""
+    uploaded = st.file_uploader("Upload your own JSE portfolio (CSV with columns ticker,weight)", type="csv",
+                                key=f"{key}_upload",
+                                help="e.g. NPN.JO,0.15. The .JO suffix is optional. Weights are normalised to 100%.")
+    if uploaded is not None:
+        try:
+            w = read_portfolio_csv(uploaded)
+        except ValueError as exc:
+            st.error(f"Could not read that file: {exc}")
+            return None
+        st.caption(f"Using your uploaded portfolio ({len(w)} holdings). Remove the file to edit the sample instead.")
+        st.dataframe(w.to_frame("weight").style.format("{:.1%}"), use_container_width=True)
+        return w
+    st.write("Or edit the sample holdings (ticker, weight). Weights are normalised to 100%.")
+    edited = st.data_editor(pd.read_csv(SAMPLE_PORTFOLIO), num_rows="dynamic", use_container_width=True,
+                            key=f"{key}_editor").dropna()
+    if edited.empty:
+        return None
+    try:
+        return read_portfolio_csv(io.StringIO(edited.to_csv(index=False)))
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
+
+
+def warn_unknown(w: pd.Series, prices: pd.DataFrame) -> None:
+    missing = [t for t in w.index if t not in prices.columns]
+    if missing:
+        st.warning(f"No price data for {', '.join(missing)}: ignored (the app covers the JSE universe in "
+                   "jse_backtester.universe).")
+
+
+def risk_report_markdown(rep) -> str:
+    """Plain-text version of the Portfolio risk tab, for the download button."""
+    c = rep.contributions[["weight", "pct"]].rename(columns={"pct": "risk share"}).apply(lambda col: col.map("{:.1%}".format))
+    parts = ["# JSE portfolio risk report\n",
+             f"Sample: {rep.sample[0].date()} to {rep.sample[1].date()} (common history of all holdings)\n",
+             "## Risk summary\n```\n" + fmt_summary(rep.summary.to_frame("Portfolio")) + "\n```\n",
+             f"Diversification ratio: {rep.diversification_ratio:.2f}\n",
+             "## Sector weights\n```\n" + rep.sectors.map("{:.1%}".format).to_string() + "\n```\n",
+             "## Risk contributions\n```\n" + c.to_string() + "\n```\n"]
+    scen = scenario_table(rep.portfolio_returns)
+    if not scen.empty:
+        parts.append("## Stress windows (static weights)\n```\n" + scen.round(4).to_string() + "\n```\n")
+    if rep.currency is not None:
+        parts.append("## USD/ZAR exposure\n```\n" + rep.currency.summary.map("{:.3f}".format).to_string() + "\n```\n")
+    return "\n".join(parts)
+
+
+tab_bt, tab_risk, tab_opt, tab_cost = st.tabs(
+    ["Factor backtest", "Portfolio risk", "Optimisation (Min-Variance & Risk Parity)", "Cost sensitivity"])
 
 with tab_bt:
     cfg = BacktestConfig(signal=factor, top_frac=top, rebalance=rebalance,
-                         weighting=weighting, stt=stt, brokerage=brk)
+                         weighting=weighting, stt=stt, brokerage=brk, max_weight=max_weight)
     res = run_backtest(px, cfg)
     b = bench.loc[res.returns.index[0]:] if bench is not None else None
     summary = res.summary(b, rf)
@@ -130,25 +192,77 @@ with tab_bt:
     st.dataframe(summary.to_frame("Value"))
 
 with tab_risk:
-    st.write("Enter holdings (ticker, weight). Weights are normalised to 100%.")
-    default = pd.read_csv("examples/sample_portfolio.csv")
-    edited = st.data_editor(default, num_rows="dynamic", use_container_width=True)
-    w = edited.dropna().set_index("ticker")["weight"].astype(float)
-    if w.sum() > 0:
-        rep = portfolio_risk_report(w, returns_from_prices(px).iloc[1:], bench, rf, fx_returns=fx_ret)
-        st.caption(f"Sample: {rep.sample[0].date()} to {rep.sample[1].date()} | "
-                   f"diversification ratio {rep.diversification_ratio:.2f}")
-        st.dataframe(rep.summary.to_frame("Portfolio"))
-        st.pyplot(plots.plot_risk_contributions(rep.contributions))
-        st.subheader("Sector weights"), st.bar_chart(rep.sectors)
-        st.subheader("Stress windows"), st.dataframe(scenario_table(rep.portfolio_returns))
-        if rep.currency is not None:
-            exposures = {"Portfolio": rep.currency}
-            if bench is not None:
-                exposures["Benchmark"] = currency_exposure(bench.loc[rep.sample[0]:rep.sample[1]], fx_ret)
-            currency_panel(exposures, rep.currency.betas, "Rand-hedge exposure: portfolio holdings", "Portfolio")
+    st.write("Test your own JSE holdings: upload a CSV or edit the sample below.")
+    w = holdings_input("risk")
+    if w is not None:
+        warn_unknown(w, px)
+        try:
+            rep = portfolio_risk_report(w, returns_from_prices(px).iloc[1:], bench, rf, fx_returns=fx_ret)
+        except ValueError as exc:  # e.g. none of the tickers are in the price data
+            st.error(str(exc))
         else:
-            currency_panel({}, pd.DataFrame(), "", "")
+            st.caption(f"Sample: {rep.sample[0].date()} to {rep.sample[1].date()} | "
+                       f"diversification ratio {rep.diversification_ratio:.2f}")
+            st.download_button("Download risk report (Markdown)", risk_report_markdown(rep),
+                               "jse_risk_report.md", mime="text/markdown", key="risk_report_dl")
+            st.dataframe(rep.summary.to_frame("Portfolio"))
+            st.pyplot(plots.plot_risk_contributions(rep.contributions))
+            st.subheader("Sector weights"), st.bar_chart(rep.sectors)
+            st.subheader("Stress windows"), st.dataframe(scenario_table(rep.portfolio_returns))
+            if rep.currency is not None:
+                exposures = {"Portfolio": rep.currency}
+                if bench is not None:
+                    exposures["Benchmark"] = currency_exposure(bench.loc[rep.sample[0]:rep.sample[1]], fx_ret)
+                currency_panel(exposures, rep.currency.betas, "Rand-hedge exposure: portfolio holdings", "Portfolio")
+            else:
+                currency_panel({}, pd.DataFrame(), "", "")
+
+with tab_opt:
+    st.write("Compare **Equal Weight**, **Min Variance** (long-only, each stock capped at the sidebar maximum) "
+             "and **Risk Parity** (every stock contributes 1/N of portfolio risk) for your holdings. All three use "
+             "the same shrunk covariance (10% toward constant correlation) as the risk report. Results are "
+             "in-sample: for an out-of-sample test pick min_var or risk_parity as the weighting in the "
+             "backtest tab.")
+    hold = holdings_input("opt")
+    if hold is not None:
+        warn_unknown(hold, px)
+        try:
+            opt = compare_portfolios(returns_from_prices(px).iloc[1:], list(hold.index), max_weight=max_weight,
+                                     rf=rf, fx_returns=fx_ret, current=hold)
+        except ValueError as exc:  # too few holdings for the cap, too little history, ...
+            st.error(str(exc))
+        else:
+            n = len(opt.weights)
+            st.caption(f"{n} stocks | sample {opt.sample[0].date()} to {opt.sample[1].date()} "
+                       f"({opt.n_obs} common daily returns) | max weight {max_weight:.0%} for Min Variance")
+            vol = opt.metrics.loc["Ann. volatility"]
+            c = st.columns(3)
+            c[0].metric("Min-Variance volatility", f"{vol['min_var']:.1%}",
+                        f"{vol['min_var'] - vol['equal']:+.1%} vs Equal Weight", delta_color="inverse")
+            c[1].metric("Risk Parity volatility", f"{vol['risk_parity']:.1%}",
+                        f"{vol['risk_parity'] - vol['equal']:+.1%} vs Equal Weight", delta_color="inverse")
+            c[2].metric("Risk Parity: max |risk share - 1/N|", f"{opt.risk_parity_gap * 100:.4f} pp",
+                        help=f"Every Risk Parity holding contributes {1 / n:.2%} of portfolio risk")
+            st.pyplot(plots.plot_optimisation(opt.weights, opt.risk_shares, opt.metrics, opt.labels))
+
+            per_stock, metrics_tbl = optimisation_tables(opt)
+            left, right = st.columns([3, 2])
+            left.markdown("**Capital weight vs Euler risk share**")
+            left.dataframe(per_stock, use_container_width=True)
+            right.markdown("**Portfolio metrics (in-sample)**")
+            right.dataframe(metrics_tbl, use_container_width=True)
+
+            export = opt.weights.rename(columns=opt.labels).rename_axis("ticker")
+            shares = opt.risk_shares.rename(columns=lambda m: f"{opt.labels[m]} risk share")
+            d1, d2 = st.columns(2)
+            d1.download_button("Download optimised weights + risk shares (CSV)",
+                               pd.concat([export, shares], axis=1).to_csv(index_label="ticker"), "optimised_weights.csv",
+                               mime="text/csv", key="opt_weights_dl")
+            method = d2.selectbox("Export one method as ticker,weight", ["min_var", "risk_parity", "equal"],
+                                  format_func=lambda m: opt.labels[m], key="opt_method")
+            d2.download_button(f"Download {opt.labels[method]} (ticker,weight)",
+                               opt.weights[method].rename("weight").rename_axis("ticker").to_csv(),
+                               f"{method}_weights.csv", mime="text/csv", key="opt_one_dl")
 
 with tab_cost:
     st.write("Net performance of every factor at each rebalance frequency across **round-trip** trading "
@@ -158,11 +272,12 @@ with tab_cost:
                            default=list(DEFAULT_COSTS_BPS))
 
     @st.cache_data(show_spinner="Running 9 backtests...")
-    def get_grid(prices, costs, top, weighting, rf):
-        return cost_grid(prices, costs_bps=tuple(costs), top_frac=top, weighting=weighting, rf=rf)
+    def get_grid(prices, costs, top, weighting, rf, max_weight):
+        return cost_grid(prices, costs_bps=tuple(costs), top_frac=top, weighting=weighting, rf=rf,
+                         max_weight=max_weight)
 
     if costs and st.button("Run cost grid", type="primary"):
-        grid = get_grid(px, tuple(sorted(costs)), top, weighting, rf)
+        grid = get_grid(px, tuple(sorted(costs)), top, weighting, rf, max_weight)
         st.pyplot(plots.plot_cost_grid(grid, "net_sharpe"))
         st.pyplot(plots.plot_cost_grid(grid, "net_cagr"))
         cols = st.columns(3)

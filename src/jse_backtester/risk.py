@@ -312,6 +312,53 @@ def risk_contributions(weights: pd.Series, cov: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def diversification_ratio(weights: pd.Series, cov: pd.DataFrame) -> float:
+    """Weighted-average stock volatility over portfolio volatility (1.0 = no diversification)."""
+    w = weights.reindex(cov.index).fillna(0.0).to_numpy()
+    port_vol = float(np.sqrt(w @ cov.to_numpy() @ w))
+    return float((w * np.sqrt(np.diag(cov))).sum() / port_vol)
+
+
+# Trailing-window estimation (used to re-estimate the covariance before each backtest rebalance)
+TRAILING_WINDOW = 252   # trading days
+MIN_TRAILING_OBS = 126  # fewer usable days than this and the caller should not trust a covariance
+
+
+def trailing_returns(
+    returns: pd.DataFrame,
+    end: pd.Timestamp,
+    window: int = TRAILING_WINDOW,
+    min_obs: int = MIN_TRAILING_OBS,
+    names=None,
+) -> pd.DataFrame:
+    """The last ``window`` daily returns up to and including ``end`` (nothing later is ever read).
+
+    Only names with a *complete* window are kept (a stock that listed or resumed trading part-way
+    through the window would otherwise force a pairwise, possibly non-positive-definite covariance).
+    Returns an empty frame when fewer than ``min_obs`` days of history exist.
+    """
+    hist = returns.loc[:end]
+    if names is not None:
+        hist = hist[list(names)]
+    hist = hist.dropna(how="all").tail(window)  # drops the all-NaN first return row too
+    if len(hist) < min_obs:
+        return hist.iloc[0:0, 0:0]
+    return hist.loc[:, hist.notna().all()]
+
+
+def trailing_shrunk_cov(
+    returns: pd.DataFrame,
+    end: pd.Timestamp,
+    window: int = TRAILING_WINDOW,
+    shrinkage: float = 0.1,
+    min_obs: int = MIN_TRAILING_OBS,
+    names=None,
+) -> pd.DataFrame | None:
+    """``shrunk_cov`` of the trailing window ending at ``end`` (no look-ahead); None if < 2 usable names."""
+    win = trailing_returns(returns, end, window, min_obs, names)
+    return shrunk_cov(win, shrinkage) if win.shape[1] >= 2 else None
+
+
 @dataclass
 class PortfolioRiskReport:
     summary: pd.Series
@@ -347,8 +394,7 @@ def portfolio_risk_report(
     port = rets @ w
     cov = shrunk_cov(rets, shrinkage)
     contrib = risk_contributions(w, cov).sort_values("pct", ascending=False)
-    port_vol = float(np.sqrt(w.to_numpy() @ cov.to_numpy() @ w.to_numpy()))
-    div_ratio = float((w.to_numpy() * np.sqrt(np.diag(cov))).sum() / port_vol)
+    div_ratio = diversification_ratio(w, cov)
     currency = None
     if fx_returns is not None:
         betas = usdzar_betas(rets, fx_returns)

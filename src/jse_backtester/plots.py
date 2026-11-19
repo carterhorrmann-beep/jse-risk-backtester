@@ -5,8 +5,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from matplotlib.ticker import MaxNLocator, PercentFormatter  # noqa: E402
 import pandas as pd  # noqa: E402
 
+from .optimize import METHOD_LABELS  # noqa: E402
 from .risk import BUCKET_DOMESTIC, BUCKET_HEDGE, BUCKET_NEUTRAL, USDZAR_HEDGE_THRESHOLD, drawdown_series  # noqa: E402
 
 _STYLE = {"axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.alpha": 0.25}
@@ -44,6 +47,55 @@ def plot_risk_contributions(contrib: pd.DataFrame, top: int = 15) -> plt.Figure:
         ax.set_yticks(list(y)), ax.set_yticklabels(df.index)
         ax.xaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
         ax.set_title("Weight vs contribution to volatility"), ax.legend(frameon=False)
+        fig.tight_layout()
+    return fig
+
+
+WEIGHT_COLOR, RISK_COLOR = "#4c72b0", "#dd8452"
+
+
+def plot_optimisation(
+    weights: pd.DataFrame,
+    risk_shares: pd.DataFrame,
+    metrics: pd.DataFrame | None = None,
+    labels: dict[str, str] | None = None,
+) -> plt.Figure:
+    """Grouped bars of capital weight vs Euler risk contribution per stock, one panel per method.
+
+    Panels follow ``METHOD_LABELS`` (Equal Weight, Min Variance, Risk Parity) for whichever of those
+    columns ``weights`` has; the dashed line is 1/N, where every Risk Parity risk bar sits. With
+    ``metrics`` (from ``compare_portfolios``) each panel title also shows volatility and the
+    diversification ratio.
+    """
+    labels = {**METHOD_LABELS, **(labels or {})}
+    cols = [m for m in METHOD_LABELS if m in weights.columns]
+    if not cols:
+        raise ValueError("weights has none of the columns equal / min_var / risk_parity")
+    n = len(weights)
+    x = np.arange(n)
+    names = [t.replace(".JO", "") for t in weights.index]
+    top = max(weights[cols].to_numpy().max(), risk_shares[cols].to_numpy().max()) * 1.18
+    with plt.rc_context(_STYLE):
+        fig, axes = plt.subplots(len(cols), 1, figsize=(max(8.0, 0.62 * n + 2.5), 2.75 * len(cols) + 0.9),
+                                 sharex=True, sharey=True, squeeze=False)
+        for ax, m in zip(axes[:, 0], cols):
+            ax.bar(x - 0.2, weights[m], 0.4, color=WEIGHT_COLOR, label="Capital weight")
+            ax.bar(x + 0.2, risk_shares[m], 0.4, color=RISK_COLOR, label="Risk contribution")
+            ax.axhline(1.0 / n, color="k", ls="--", lw=0.8, alpha=0.6)
+            ax.text(1.005, 1.0 / n, "1/N", transform=ax.get_yaxis_transform(), ha="left", va="center",
+                    fontsize=8, alpha=0.7)
+            title = labels[m]
+            if metrics is not None and m in metrics.columns:
+                title += (f"   |   volatility {metrics.loc['Ann. volatility', m]:.1%}"
+                          f"   diversification ratio {metrics.loc['Diversification ratio', m]:.2f}")
+            ax.set_title(title, fontsize=10, loc="left")
+            ax.set_ylim(0, top)
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))  # 0, 5%, 10%, ...
+            ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+        axes[0, 0].legend(frameon=False, ncol=2, loc="upper right", fontsize=9)
+        axes[-1, 0].set_xticks(x)
+        axes[-1, 0].set_xticklabels(names, rotation=90, fontsize=8)
+        fig.suptitle("Capital weights vs risk contributions: Equal Weight, Min Variance, Risk Parity", fontsize=11)
         fig.tight_layout()
     return fig
 

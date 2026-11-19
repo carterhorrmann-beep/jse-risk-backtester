@@ -15,4 +15,6 @@ jobs:
       - run: pytest -q
       - run: jse-bt backtest --source synthetic --factor momentum --out reports/ci
       - run: jse-bt risk --source synthetic --out reports/ci-risk
+      - run: jse-bt optimize --source synthetic --out reports/ci-optimize
+      - run: jse-bt backtest --source synthetic --factor momentum --weighting risk_parity --out reports/ci-rp
       - run: jse-bt cost-grid --source synthetic --out reports/ci-grid

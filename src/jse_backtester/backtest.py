@@ -7,15 +7,21 @@ Timeline for one rebalance:
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 from .factors import SIGNALS
-from .risk import CURRENCY_ROLL_WINDOW, DEFAULT_RF, CurrencyExposure, currency_exposure, risk_summary, usdzar_betas
+from .optimize import DEFAULT_MAX_WEIGHT, DEFAULT_SHRINKAGE, optimise_weights
+from .risk import (CURRENCY_ROLL_WINDOW, DEFAULT_RF, TRAILING_WINDOW, CurrencyExposure, currency_exposure,
+                   risk_summary, shrunk_cov, trailing_returns, usdzar_betas)
 from .universe import FX_TICKERS
 from .utils import TRADING_DAYS, rebalance_dates, returns_from_prices
+
+
+WEIGHTINGS = ("equal", "inv_vol", "min_var", "risk_parity")
 
 
 @dataclass
@@ -24,11 +30,14 @@ class BacktestConfig:
     signal_params: dict = field(default_factory=dict)
     top_frac: float = 0.3            # fraction of the universe in each leg
     long_only: bool = True           # False -> long top / short bottom (factor portfolio)
-    weighting: str = "equal"         # "equal" or "inv_vol"
+    weighting: str = "equal"         # "equal", "inv_vol", "min_var" or "risk_parity"
     rebalance: str = "M"             # "W", "M" or "Q"
     lag: int = 1                     # trading days between signal and execution
     min_names: int = 6               # hold cash if fewer names have a valid signal
     vol_window: int = 60             # for inverse-vol weighting
+    max_weight: float = DEFAULT_MAX_WEIGHT  # per-name cap for "min_var" (relaxed to 1/N for tiny books)
+    opt_window: int = TRAILING_WINDOW       # trailing days used to re-estimate the covariance
+    shrinkage: float = DEFAULT_SHRINKAGE    # covariance shrinkage toward constant correlation
     # JSE costs (fractions of traded value). Defaults are assumptions: set your own.
     stt: float = 0.0025              # Securities Transfer Tax, 0.25% on purchases
     brokerage: float = 0.0015        # brokerage + STRATE + levies, each way
@@ -55,13 +64,50 @@ class BacktestResult:
         return s
 
 
+def optimised_leg_weights(
+    names: pd.Index, date: pd.Timestamp, rets: pd.DataFrame, cfg: BacktestConfig
+) -> pd.Series:
+    """min_var / risk_parity weights (summing to 1) for the names held on ``date``.
+
+    The shrunk covariance is re-estimated from the ``cfg.opt_window`` daily returns ending on
+    ``date`` (the signal date), so it only sees data the strategy had when it fixed the targets;
+    trades execute ``cfg.lag`` days later. Names without a complete window share equally in the
+    weight an optimiser cannot assign them, and with fewer than two estimable names (or too short a
+    history) the leg falls back to equal weights. The ``max_weight`` cap is relaxed to ``1/N``
+    when the leg holds fewer names than the cap allows.
+    """
+    k = len(names)
+    out = pd.Series(1.0 / k, index=names)
+    win = trailing_returns(rets, date, cfg.opt_window, names=names)
+    ok = list(win.columns)
+    if len(ok) < 2:
+        return out
+    try:
+        w = optimise_weights(shrunk_cov(win, cfg.shrinkage), cfg.weighting, max(cfg.max_weight, 1.0 / len(ok)))
+    except RuntimeError as exc:  # a solver failure must not abort a ten-year backtest
+        warnings.warn(f"{cfg.weighting} fell back to equal weights on {pd.Timestamp(date).date()}: {exc}",
+                      RuntimeWarning, stacklevel=2)
+        return out
+    out[ok] = w.to_numpy() * len(ok) / k
+    return out
+
+
 def build_weights(
     signal: pd.DataFrame,
     dates: pd.DatetimeIndex,
     vol: pd.DataFrame,
     cfg: BacktestConfig,
+    rets: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Target weights at each signal date. Long leg sums to +1, short leg (if any) to -1."""
+    """Target weights at each signal date. Long leg sums to +1, short leg (if any) to -1.
+
+    ``rets`` (daily returns, same columns as ``signal``) is required for ``min_var`` and
+    ``risk_parity``; each leg is optimised separately on trailing data only (see optimised_leg_weights).
+    """
+    if cfg.weighting not in WEIGHTINGS:
+        raise ValueError(f"unknown weighting {cfg.weighting!r}; choose from {WEIGHTINGS}")
+    if cfg.weighting in ("min_var", "risk_parity") and rets is None:
+        raise ValueError(f"weighting {cfg.weighting!r} needs the daily returns (rets=...)")
     W = pd.DataFrame(0.0, index=dates, columns=signal.columns)
     for d in dates:
         s = signal.loc[d].dropna()
@@ -78,6 +124,8 @@ def build_weights(
                 if inv.notna().any():  # names lacking a vol estimate get the average weight
                     inv = inv.fillna(inv.mean())
                     w = inv / inv.sum()
+            elif cfg.weighting in ("min_var", "risk_parity"):
+                w = optimised_leg_weights(names, d, rets, cfg)
             W.loc[d, names] = sign * w.to_numpy()
     return W
 
@@ -137,7 +185,7 @@ def run_backtest(
     signal = SIGNALS[cfg.signal](px, **cfg.signal_params)
     rets = returns_from_prices(px)
     vol = rets.rolling(cfg.vol_window).std()
-    targets = build_weights(signal, rebalance_dates(px.index, cfg.rebalance), vol, cfg)
+    targets = build_weights(signal, rebalance_dates(px.index, cfg.rebalance), vol, cfg, rets)
     return simulate(rets, targets, cfg)
 
 
